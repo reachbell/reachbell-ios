@@ -22,6 +22,7 @@ struct APIClient: Sendable {
         request.setValue(ReachBellConstants.Header.json, forHTTPHeaderField: ReachBellConstants.Header.contentType)
         request.setValue(ReachBellConstants.Header.json, forHTTPHeaderField: ReachBellConstants.Header.accept)
         request.setValue(configuration.apiKey, forHTTPHeaderField: ReachBellConstants.Header.apiKey)
+        request.setValue(DeviceInfo.current.userAgent, forHTTPHeaderField: ReachBellConstants.Header.userAgent)
 
         let data: Data
         let response: URLResponse

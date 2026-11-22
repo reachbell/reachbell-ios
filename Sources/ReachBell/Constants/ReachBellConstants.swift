@@ -9,12 +9,14 @@ enum ReachBellConstants {
         static let apiKey = "x-api-key"
         static let contentType = "Content-Type"
         static let accept = "Accept"
+        static let userAgent = "User-Agent"
         static let json = "application/json"
     }
 
     enum Path {
         static let subscribers = "/subscribers"
         static let identify = "/subscribers/identify"
+        static let unidentify = "/subscribers/unidentify"
         static let tag = "/subscribers/tag"
         static let untag = "/subscribers/untag"
     }
@@ -27,5 +29,7 @@ enum ReachBellConstants {
     enum StorageKey {
         static let apnsToken = "com.reachbell.apnsToken"
         static let externalId = "com.reachbell.externalId"
+        /// The subscriber token of the last successful `POST /subscribers`, sent as `previousToken` when APNs rotates it.
+        static let registeredToken = "com.reachbell.registeredToken"
     }
 }

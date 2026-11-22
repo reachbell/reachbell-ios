@@ -41,6 +41,51 @@ final class ReachBellTests: XCTestCase {
         XCTAssertEqual(body["tokenType"] as? String, "apns")
         XCTAssertEqual(body["platform"] as? String, "ios")
         XCTAssertNil(body["externalId"])
+        XCTAssertNil(body["previousToken"])
+        XCTAssertEqual(body["os"] as? String, DeviceInfo.current.os)
+        XCTAssertEqual(body["osVersion"] as? String, DeviceInfo.current.osVersion)
+        let userAgent = try XCTUnwrap(request.value(forHTTPHeaderField: "User-Agent"))
+        XCTAssertTrue(userAgent.hasPrefix("ReachBell/\(ReachBell.version) ("), userAgent)
+        XCTAssertTrue(userAgent.hasSuffix(") reachbell-ios/\(ReachBell.version)"), userAgent)
+    }
+
+    func testRotatedTokenSendsPreviousToken() async throws {
+        let transport = MockTransport()
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        client.setAPNsToken(Data([0x01, 0x02]))
+        await client.waitForPendingRegistration()
+
+        XCTAssertEqual(transport.requests.count, 2)
+        XCTAssertNil(jsonBody(transport.requests[0])["previousToken"])
+        let body = jsonBody(transport.requests[1])
+        XCTAssertEqual(body["token"] as? String, "0102")
+        XCTAssertEqual(body["previousToken"] as? String, tokenHex)
+    }
+
+    func testSameTokenAgainSendsNoPreviousToken() async throws {
+        let transport = MockTransport()
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        XCTAssertEqual(transport.requests.count, 2)
+        XCTAssertNil(jsonBody(transport.requests[1])["previousToken"])
+    }
+
+    func testTokenStoredBy100IsSentAsPreviousTokenOnRotation() async throws {
+        let defaults = makeDefaults()
+        defaults.set(tokenHex, forKey: "com.reachbell.apnsToken")
+        let transport = MockTransport()
+        let client = makeClient(transport, defaults: defaults)
+
+        client.setAPNsToken(Data([0x01, 0x02]))
+        await client.waitForPendingRegistration()
+
+        XCTAssertEqual(jsonBody(transport.requests[0])["previousToken"] as? String, tokenHex)
     }
 
     func testIdentifyBeforeTokenIsStashedAndFoldedIntoRegistration() async throws {
@@ -228,6 +273,102 @@ final class ReachBellTests: XCTestCase {
         XCTAssertNil(client.externalId)
         XCTAssertNil(ReachBell(userDefaults: defaults, transport: MockTransport()).apnsToken)
     }
+
+    func testResetUnidentifiesStoredTokenBeforeTheNextRegistration() async throws {
+        let transport = MockTransport()
+        let client = makeClient(transport)
+        try await client.identify("user_3")
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        client.reset()
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        XCTAssertEqual(
+            transport.requests.map { $0.url?.path },
+            ["/subscribers", "/subscribers/unidentify", "/subscribers"]
+        )
+        XCTAssertEqual(jsonBody(transport.requests[1])["token"] as? String, tokenHex)
+        let body = jsonBody(transport.requests[2])
+        XCTAssertNil(body["externalId"])
+        XCTAssertNil(body["previousToken"])
+    }
+
+    func testResetIgnoresUnidentifyFailure() async throws {
+        let transport = MockTransport(replies: [
+            .json(status: 201, body: "{}"),
+            .failure(URLError(.notConnectedToInternet))
+        ])
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        client.reset()
+        await client.waitForPendingRegistration()
+
+        XCTAssertEqual(transport.requests.last?.url?.path, "/subscribers/unidentify")
+        XCTAssertNil(client.apnsToken)
+    }
+
+    func testResetWithoutTokenSendsNothing() async {
+        let transport = MockTransport()
+        let client = makeClient(transport)
+
+        client.reset()
+        await client.waitForPendingRegistration()
+
+        XCTAssertTrue(transport.requests.isEmpty)
+    }
+
+    func testResetDropsInFlightRegistrationResult() async throws {
+        let transport = MockTransport(replies: [.delayed(seconds: 2, status: 201, body: "{}")])
+        let client = makeClient(transport)
+        let calls = Locked(0)
+        client.onRegistrationResult = { _ in calls.mutate { $0 += 1 } }
+
+        client.setAPNsToken(tokenData)
+        for _ in 0..<200 where transport.requests.isEmpty {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(transport.requests.count, 1)
+
+        client.reset()
+        await client.waitForPendingRegistration()
+        XCTAssertEqual(calls.read { $0 }, 0)
+        XCTAssertNil(client.apnsToken)
+
+        // The cancelled registration was not recorded, so the next one has no previousToken.
+        client.setAPNsToken(Data([0x01, 0x02]))
+        await client.waitForPendingRegistration()
+        XCTAssertNil(jsonBody(transport.requests.last!)["previousToken"])
+    }
+
+    func testURLSessionTransportCancelsDataTaskWhenTaskIsCancelled() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingURLProtocol.self]
+        let transport = URLSessionTransport(session: URLSession(configuration: configuration))
+        let request = URLRequest(url: URL(string: "https://api.example.test/subscribers")!)
+
+        let task = Task { try await transport.send(request) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .cancelled)
+        }
+    }
+}
+
+/// Never answers, so only cancellation can end the request.
+private final class HangingURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {}
+    override func stopLoading() {}
 }
 
 private final class ResultBox: Sendable {

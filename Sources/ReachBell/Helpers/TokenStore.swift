@@ -17,9 +17,15 @@ final class TokenStore: @unchecked Sendable {
         set { write(newValue, forKey: ReachBellConstants.StorageKey.externalId) }
     }
 
+    var registeredToken: String? {
+        get { defaults.string(forKey: ReachBellConstants.StorageKey.registeredToken) }
+        set { write(newValue, forKey: ReachBellConstants.StorageKey.registeredToken) }
+    }
+
     func clear() {
         defaults.removeObject(forKey: ReachBellConstants.StorageKey.apnsToken)
         defaults.removeObject(forKey: ReachBellConstants.StorageKey.externalId)
+        defaults.removeObject(forKey: ReachBellConstants.StorageKey.registeredToken)
     }
 
     private func write(_ value: String?, forKey key: String) {
