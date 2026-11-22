@@ -5,6 +5,8 @@ final class MockTransport: ReachBellTransport, @unchecked Sendable {
     enum Reply {
         case json(status: Int, body: String)
         case failure(Error)
+        /// Answers after `seconds`; cancelling the calling task ends it early with `CancellationError`.
+        case delayed(seconds: Double, status: Int, body: String)
     }
 
     private struct Queue {
@@ -36,6 +38,10 @@ final class MockTransport: ReachBellTransport, @unchecked Sendable {
             return (Data(body.utf8), response)
         case .failure(let error):
             throw error
+        case .delayed(let seconds, let status, let body):
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+            return (Data(body.utf8), response)
         }
     }
 }

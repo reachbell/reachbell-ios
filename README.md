@@ -29,6 +29,19 @@ targets: [
 
 Enable the **Push Notifications** capability on your app target and configure your APNs key in the ReachBell dashboard. Test on a physical device: the iOS Simulator does not receive remote pushes.
 
+APNs tokens only work in the environment that issued them. Builds run from Xcode (development signing) get sandbox tokens; TestFlight and App Store builds get production tokens. The APNs `sandbox` setting applies to every subscriber in a ReachBell project, and ReachBell deactivates a subscriber when Apple rejects its token as a bad device token. So do not flip `sandbox` on your live project to test a development build: every App Store and TestFlight subscriber would be rejected and deactivated on the next send.
+
+Use a separate ReachBell project for development builds instead, with its own API key and `sandbox` on, and keep `sandbox` off in the project your release builds use. Pick the key at build time, for example:
+
+```swift
+#if DEBUG
+let reachBellKey = "rb_live_..." // development project, APNs sandbox on
+#else
+let reachBellKey = "rb_live_..." // production project, APNs sandbox off
+#endif
+ReachBell.shared.configure(apiKey: reachBellKey)
+```
+
 ## Quick start
 
 ```swift
@@ -69,7 +82,7 @@ SwiftUI apps attach the same `AppDelegate` with `@UIApplicationDelegateAdaptor(A
 | `ReachBell.shared` | The shared, thread-safe instance. |
 | `configure(apiKey:apiUrl:)` | Sets your public `rb_live_` key. `apiUrl` defaults to `https://api.reachbell.com`. Every request sends `x-api-key`. |
 | `requestAuthorizationAndRegister(options:) async throws -> Bool` | Asks for notification permission (`[.alert, .sound, .badge]` by default) and calls `registerForRemoteNotifications()`. Throws `.notificationAuthorizationDenied` when permission is refused. iOS only. |
-| `setAPNsToken(_ deviceToken: Data)` | Converts the token to lowercase hex, persists it and registers the subscriber in the background with `POST /subscribers { token, tokenType: "apns", platform: "ios", externalId? }`. |
+| `setAPNsToken(_ deviceToken: Data)` | Converts the token to lowercase hex, persists it and registers the subscriber in the background with `POST /subscribers { token, tokenType: "apns", platform: "ios", externalId?, previousToken? }`. When the token differs from the last registered one, `previousToken` carries the old token and ReachBell moves its tags and external id to the new one. |
 | `onRegistrationResult` | Optional `@Sendable (Result<Void, ReachBellError>) -> Void` called after every registration triggered by `setAPNsToken(_:)`. It runs on a background thread, so hop to the main actor before touching UI. |
 | `register() async throws` | Registers the stored token again (for example to retry after a failure reported to `onRegistrationResult`). Throws `.noToken` if no token is stored. |
 | `waitForPendingRegistration() async` | Waits for the background registration started by `setAPNsToken(_:)` to finish. |
@@ -78,9 +91,11 @@ SwiftUI apps attach the same `AppDelegate` with `@UIApplicationDelegateAdaptor(A
 | `identify(_ externalId: String) async throws` | Calls `POST /subscribers/identify`. Before a token exists it does not throw: the id is stored and sent with the next registration. |
 | `tag(_ tags: [String]) async throws` | Calls `POST /subscribers/tag`. Throws `.noToken` without a token. |
 | `untag(_ tags: [String]) async throws` | Calls `POST /subscribers/untag`. Throws `.noToken` without a token. |
-| `reset()` | Forgets the stored token and external id, for example on logout. |
+| `reset()` | Call on logout. Forgets the stored token and external id immediately, cancels an in-flight registration (its `onRegistrationResult` is not called) and calls `POST /subscribers/unidentify` for the old token in the background, ignoring errors. If APNs rotated the token and the new one is not registered yet, both tokens are unidentified. The next registration, `identify`, `tag` and `untag` wait for that call. The first registration after `reset()` without an external id sends `"externalId": null`, so the server drops the old user's link even if the unidentify call failed offline. |
 
 `identify`, `tag` and `untag` wait for an in-flight registration before sending, so calling them right after `setAPNsToken(_:)` is safe.
+
+`reset()` also forgets the stored APNs token. Until `setAPNsToken(_:)` runs again, `tag` and `untag` throw `.noToken` and `identify` only stores the id. For the next user, call `UIApplication.shared.registerForRemoteNotifications()` (or `requestAuthorizationAndRegister()`) after `reset()` so iOS hands the token back to `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`; the id passed to `identify` before that is sent with the registration.
 
 The token and external id are persisted in `UserDefaults`, so they survive a relaunch. To use an app group or a custom suite, or to inject a transport in tests, create your own instance:
 
@@ -91,7 +106,9 @@ let reachBell = ReachBell(
 )
 ```
 
-`ReachBellTransport` is a one-method protocol (`send(_ request: URLRequest) async throws -> (Data, URLResponse)`) that you can implement to stub the network.
+Requests send a `User-Agent` such as `ReachBell/1.0.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X; iPhone15,2) reachbell-ios/1.0.0` and `os`, `osVersion` and `device` fields, so the dashboard shows the device as iOS mobile or tablet.
+
+`ReachBellTransport` is a one-method protocol (`send(_ request: URLRequest) async throws -> (Data, URLResponse)`) that you can implement to stub the network. `URLSessionTransport` cancels its data task when the calling task is cancelled; custom transports should honour cancellation too.
 
 ## Errors
 
