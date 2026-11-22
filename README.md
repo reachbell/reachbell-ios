@@ -29,6 +29,8 @@ targets: [
 
 Enable the **Push Notifications** capability on your app target and configure your APNs key in the ReachBell dashboard. Test on a physical device: the iOS Simulator does not receive remote pushes.
 
+APNs tokens only work in the environment that issued them. Builds run from Xcode (development signing) get sandbox tokens, so turn on the APNs `sandbox` setting for the project while testing them; TestFlight and App Store builds get production tokens and need `sandbox` off. A mismatch makes Apple reject every push as a bad device token.
+
 ## Quick start
 
 ```swift
