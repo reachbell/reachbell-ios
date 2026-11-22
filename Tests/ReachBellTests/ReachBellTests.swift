@@ -291,8 +291,88 @@ final class ReachBellTests: XCTestCase {
         )
         XCTAssertEqual(jsonBody(transport.requests[1])["token"] as? String, tokenHex)
         let body = jsonBody(transport.requests[2])
-        XCTAssertNil(body["externalId"])
+        // C1a: the first registration after reset() clears the external id with an explicit null.
+        XCTAssertTrue(body["externalId"] is NSNull)
         XCTAssertNil(body["previousToken"])
+    }
+
+    func testOnlyFirstRegistrationAfterResetSendsNullExternalId() async throws {
+        let defaults = makeDefaults()
+        let transport = MockTransport(replies: [
+            .json(status: 201, body: "{}"),
+            .failure(URLError(.notConnectedToInternet)) // unidentify fails offline
+        ])
+        let client = makeClient(transport, defaults: defaults)
+        try await client.identify("user_3")
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        client.reset()
+        await client.waitForPendingRegistration()
+        // Persisted, so a relaunch before the next registration still sends the null.
+        XCTAssertTrue(defaults.bool(forKey: "com.reachbell.externalIdClearPending"))
+
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+        let raw = try XCTUnwrap(transport.requests.last?.httpBody).utf8String
+        XCTAssertTrue(raw.contains("\"externalId\":null"), raw)
+        XCTAssertFalse(defaults.bool(forKey: "com.reachbell.externalIdClearPending"))
+
+        try await client.register()
+        XCTAssertNil(jsonBody(transport.requests.last!)["externalId"])
+    }
+
+    func testFailedRegistrationAfterResetKeepsNullExternalIdPending() async throws {
+        let transport = MockTransport(replies: [
+            .json(status: 201, body: "{}"),
+            .json(status: 200, body: "{\"success\":true}"),
+            .failure(URLError(.notConnectedToInternet))
+        ])
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+        client.reset()
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        try await client.register()
+        XCTAssertEqual(transport.requests.count, 4)
+        XCTAssertTrue(jsonBody(transport.requests[3])["externalId"] is NSNull)
+    }
+
+    func testExternalIdSetAfterResetIsSentInsteadOfNull() async throws {
+        let transport = MockTransport()
+        let client = makeClient(transport)
+        try await client.identify("user_3")
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        client.reset()
+        try await client.identify("user_4")
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        XCTAssertEqual(jsonBody(transport.requests.last!)["externalId"] as? String, "user_4")
+    }
+
+    func testResetDuringUnregisteredRotationUnidentifiesBothTokens() async throws {
+        let transport = MockTransport(replies: [
+            .json(status: 201, body: "{}"),
+            .failure(URLError(.notConnectedToInternet)) // the rotated token's registration fails
+        ])
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+        client.setAPNsToken(Data([0x01, 0x02]))
+        await client.waitForPendingRegistration()
+
+        client.reset()
+        await client.waitForPendingRegistration()
+
+        let unidentified = transport.requests
+            .filter { $0.url?.path == "/subscribers/unidentify" }
+            .compactMap { jsonBody($0)["token"] as? String }
+        XCTAssertEqual(unidentified, [tokenHex, "0102"])
     }
 
     func testResetIgnoresUnidentifyFailure() async throws {
@@ -369,6 +449,10 @@ private final class HangingURLProtocol: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {}
     override func stopLoading() {}
+}
+
+private extension Data {
+    var utf8String: String { String(decoding: self, as: UTF8.self) }
 }
 
 private final class ResultBox: Sendable {

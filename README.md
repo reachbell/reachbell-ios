@@ -91,9 +91,11 @@ SwiftUI apps attach the same `AppDelegate` with `@UIApplicationDelegateAdaptor(A
 | `identify(_ externalId: String) async throws` | Calls `POST /subscribers/identify`. Before a token exists it does not throw: the id is stored and sent with the next registration. |
 | `tag(_ tags: [String]) async throws` | Calls `POST /subscribers/tag`. Throws `.noToken` without a token. |
 | `untag(_ tags: [String]) async throws` | Calls `POST /subscribers/untag`. Throws `.noToken` without a token. |
-| `reset()` | Call on logout. Forgets the stored token and external id immediately, cancels an in-flight registration (its `onRegistrationResult` is not called) and calls `POST /subscribers/unidentify` for the old token in the background, ignoring errors. The next registration, `identify`, `tag` and `untag` wait for that call. |
+| `reset()` | Call on logout. Forgets the stored token and external id immediately, cancels an in-flight registration (its `onRegistrationResult` is not called) and calls `POST /subscribers/unidentify` for the old token in the background, ignoring errors. If APNs rotated the token and the new one is not registered yet, both tokens are unidentified. The next registration, `identify`, `tag` and `untag` wait for that call. The first registration after `reset()` without an external id sends `"externalId": null`, so the server drops the old user's link even if the unidentify call failed offline. |
 
 `identify`, `tag` and `untag` wait for an in-flight registration before sending, so calling them right after `setAPNsToken(_:)` is safe.
+
+`reset()` also forgets the stored APNs token. Until `setAPNsToken(_:)` runs again, `tag` and `untag` throw `.noToken` and `identify` only stores the id. For the next user, call `UIApplication.shared.registerForRemoteNotifications()` (or `requestAuthorizationAndRegister()`) after `reset()` so iOS hands the token back to `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`; the id passed to `identify` before that is sent with the registration.
 
 The token and external id are persisted in `UserDefaults`, so they survive a relaunch. To use an app group or a custom suite, or to inject a transport in tests, create your own instance:
 

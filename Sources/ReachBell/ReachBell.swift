@@ -98,8 +98,8 @@ public final class ReachBell: @unchecked Sendable {
 
     private func register(expectedGeneration: Int?) async throws {
         let client = try makeClient()
-        let (token, externalId, registered, generation) = state.read { current in
-            (store.apnsToken, store.externalId, store.registeredToken, current.generation)
+        let (token, externalId, registered, clearPending, generation) = state.read { current in
+            (store.apnsToken, store.externalId, store.registeredToken, store.externalIdClearPending, current.generation)
         }
         if let expected = expectedGeneration, expected != generation {
             return
@@ -116,13 +116,16 @@ public final class ReachBell: @unchecked Sendable {
             previousToken: registered == token ? nil : registered,
             os: device.os,
             osVersion: device.osVersion,
-            device: device.deviceType
+            device: device.deviceType,
+            // C1a: after reset(), the first registration without an external id clears it server-side.
+            clearExternalId: externalId == nil && clearPending
         )
         _ = try await client.post(ReachBellConstants.Path.subscribers, body: body)
         state.mutate { current in
             // Do not resurrect a subscription that reset() cleared while the request was in flight.
             if current.generation == generation {
                 store.registeredToken = token
+                store.externalIdClearPending = false
             }
         }
     }
@@ -158,12 +161,18 @@ public final class ReachBell: @unchecked Sendable {
     /// Logs the device out. Forgets the stored token and external id immediately, cancels an in-flight
     /// registration (its result is dropped) and, in the background, calls `POST /subscribers/unidentify`
     /// for the token that was stored (best effort, errors are ignored). `identify`, `tag`, `untag` and the
-    /// next registration wait for that call.
+    /// next registration wait for that call. The APNs token is forgotten too: call
+    /// `registerForRemoteNotifications()` again so `setAPNsToken(_:)` registers the device for the next user.
     public func reset() {
         let client = try? makeClient()
         state.mutate { current in
             current.generation += 1
-            let token = store.registeredToken ?? store.apnsToken
+            // After an APNs rotation whose registration is in flight (or failed), registeredToken is the
+            // old subscriber and apnsToken the new one, which the API may already have linked to the
+            // user: unidentify both so neither keeps the old user's external id.
+            let registered = store.registeredToken
+            let apns = store.apnsToken
+            let tokens = registered == apns ? [apns].compactMap { $0 } : [registered, apns].compactMap { $0 }
             let previous = current.pendingRegistration
             if current.pendingIsRegistration {
                 previous?.cancel()
@@ -172,13 +181,15 @@ public final class ReachBell: @unchecked Sendable {
             current.pendingIsRegistration = false
             current.pendingRegistration = Task {
                 await previous?.value
-                guard let client = client, let token = token else {
+                guard let client = client else {
                     return
                 }
-                try? await client.mutate(
-                    ReachBellConstants.Path.unidentify,
-                    body: UnidentifyBody(token: token)
-                )
+                for token in tokens {
+                    try? await client.mutate(
+                        ReachBellConstants.Path.unidentify,
+                        body: UnidentifyBody(token: token)
+                    )
+                }
             }
         }
     }

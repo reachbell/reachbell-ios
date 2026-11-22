@@ -31,5 +31,7 @@ enum ReachBellConstants {
         static let externalId = "com.reachbell.externalId"
         /// The subscriber token of the last successful `POST /subscribers`, sent as `previousToken` when APNs rotates it.
         static let registeredToken = "com.reachbell.registeredToken"
+        /// Set by `reset()`: the next `POST /subscribers` without an external id sends `"externalId": null`.
+        static let externalIdClearPending = "com.reachbell.externalIdClearPending"
     }
 }
