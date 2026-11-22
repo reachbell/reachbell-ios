@@ -11,11 +11,12 @@ public final class ReachBell: @unchecked Sendable {
     private struct State {
         var configuration: ReachBellConfiguration?
         var onRegistrationResult: RegistrationResultHandler?
-        /// The tail of the background work chain: registrations from `setAPNsToken(_:)` and the
-        /// unidentify call from `reset()`. identify/tag/untag wait for it.
+        /// The tail of the background work chain: registrations from `setAPNsToken(_:)` and `register()`,
+        /// and the unidentify call from `reset()`. Each link waits for the previous one; identify/tag/untag
+        /// wait for the tail.
         var pendingRegistration: Task<Void, Never>?
-        /// Whether `pendingRegistration` is a registration (cancelled by `reset()`) rather than a reset.
-        var pendingIsRegistration = false
+        /// Cancels the registrations queued since the last `reset()`; nil when there are none.
+        var cancelPendingRegistrations: (@Sendable () -> Void)?
         /// Bumped by `reset()`. Work started under an older generation does not report or persist results.
         var generation = 0
     }
@@ -56,29 +57,59 @@ public final class ReachBell: @unchecked Sendable {
 
     public func setAPNsToken(_ deviceToken: Data) {
         let token = deviceToken.lowercaseHexString
-        state.mutate { current in
+        state.mutate { _ in
             if store.registeredToken == nil, let stored = store.apnsToken, stored != token {
                 // 1.0.0 did not record the registered token separately; the stored one is it.
                 store.registeredToken = stored
             }
             store.apnsToken = token
+        }
+        _ = enqueueRegistration(notify: true)
+    }
+
+    /// Registers the stored token again (for example to retry after a failure reported to
+    /// `onRegistrationResult`). Runs on the same chain as `setAPNsToken(_:)` and `reset()`: it waits for
+    /// work queued before it, and `reset()` cancels it, in which case it throws `CancellationError`.
+    public func register() async throws {
+        _ = try makeClient()
+        let task = enqueueRegistration(notify: false)
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard let result = result else {
+            throw CancellationError()
+        }
+        try result.get()
+    }
+
+    /// Appends a registration to the work chain. Its value is nil when `reset()` cancelled or superseded it.
+    private func enqueueRegistration(notify: Bool) -> Task<Result<Void, ReachBellError>?, Never> {
+        state.mutate { current in
             let previous = current.pendingRegistration
             let generation = current.generation
-            current.pendingIsRegistration = true
-            current.pendingRegistration = Task {
+            let task = Task { () -> Result<Void, ReachBellError>? in
                 await previous?.value
-                await self.performRegistration(generation: generation)
+                return await self.performRegistration(generation: generation, notify: notify)
             }
+            let cancelEarlier = current.cancelPendingRegistrations
+            current.cancelPendingRegistrations = {
+                cancelEarlier?()
+                task.cancel()
+            }
+            current.pendingRegistration = Task { _ = await task.value }
+            return task
         }
     }
 
-    private func performRegistration(generation: Int) async {
+    private func performRegistration(generation: Int, notify: Bool) async -> Result<Void, ReachBellError>? {
         guard !Task.isCancelled, isCurrent(generation) else {
-            return
+            return nil
         }
         let result: Result<Void, ReachBellError>
         do {
-            try await register(expectedGeneration: generation)
+            try await register(generation: generation)
             result = .success(())
         } catch let error as ReachBellError {
             result = .failure(error)
@@ -87,21 +118,24 @@ public final class ReachBell: @unchecked Sendable {
         }
         // reset() ran while the request was in flight: the result belongs to the previous user.
         guard !Task.isCancelled, isCurrent(generation) else {
-            return
+            return nil
         }
-        onRegistrationResult?(result)
+        if notify {
+            onRegistrationResult?(result)
+        }
+        return result
     }
 
-    public func register() async throws {
-        try await register(expectedGeneration: nil)
-    }
-
-    private func register(expectedGeneration: Int?) async throws {
+    private func register(generation expected: Int) async throws {
         let client = try makeClient()
-        let (token, externalId, registered, clearPending, generation) = state.read { current in
-            (store.apnsToken, store.externalId, store.registeredToken, store.externalIdClearPending, current.generation)
-        }
-        if let expected = expectedGeneration, expected != generation {
+        // One snapshot: the token, the external id and the pending clear are read together, so an
+        // identify() (which sets the id and drops the clear under the same lock) is seen whole or not at all.
+        let snapshot: (token: String?, externalId: String?, registered: String?, clearPending: Bool)? =
+            state.read { current in
+                guard current.generation == expected else { return nil }
+                return (store.apnsToken, store.externalId, store.registeredToken, store.externalIdClearPending)
+            }
+        guard let (token, externalId, registered, clearPending) = snapshot else {
             return
         }
         guard let token = token else {
@@ -123,7 +157,7 @@ public final class ReachBell: @unchecked Sendable {
         _ = try await client.post(ReachBellConstants.Path.subscribers, body: body)
         state.mutate { current in
             // Do not resurrect a subscription that reset() cleared while the request was in flight.
-            if current.generation == generation {
+            if current.generation == expected {
                 store.registeredToken = token
                 store.externalIdClearPending = false
             }
@@ -136,10 +170,18 @@ public final class ReachBell: @unchecked Sendable {
 
     public func identify(_ externalId: String) async throws {
         let client = try makeClient()
-        await waitForPendingRegistration()
-        let token: String? = state.mutate { _ in
+        // Stash the id and drop a pending clear in one step: a registration that has not read its snapshot
+        // yet sends this id instead of `externalId: null`, and one already in flight finishes (below)
+        // before the identify call, so a null can never land after this id.
+        let generation: Int = state.mutate { current in
             store.externalId = externalId
-            return store.apnsToken
+            store.externalIdClearPending = false
+            return current.generation
+        }
+        await waitForPendingRegistration()
+        // A reset() since then logged this user out: do not link them again.
+        let token: String? = state.read { current in
+            current.generation == generation ? store.apnsToken : nil
         }
         guard let token = token else {
             return
@@ -158,8 +200,9 @@ public final class ReachBell: @unchecked Sendable {
         try await sendTags(tags, to: ReachBellConstants.Path.untag)
     }
 
-    /// Logs the device out. Forgets the stored token and external id immediately, cancels an in-flight
-    /// registration (its result is dropped) and, in the background, calls `POST /subscribers/unidentify`
+    /// Logs the device out. Forgets the stored token and external id immediately, cancels queued and
+    /// in-flight registrations, including `register()` calls (their results are dropped and `register()`
+    /// throws `CancellationError`) and, in the background, calls `POST /subscribers/unidentify`
     /// for the token that was stored (best effort, errors are ignored). `identify`, `tag`, `untag` and the
     /// next registration wait for that call. The APNs token is forgotten too: call
     /// `registerForRemoteNotifications()` again so `setAPNsToken(_:)` registers the device for the next user.
@@ -174,11 +217,9 @@ public final class ReachBell: @unchecked Sendable {
             let apns = store.apnsToken
             let tokens = registered == apns ? [apns].compactMap { $0 } : [registered, apns].compactMap { $0 }
             let previous = current.pendingRegistration
-            if current.pendingIsRegistration {
-                previous?.cancel()
-            }
+            current.cancelPendingRegistrations?()
+            current.cancelPendingRegistrations = nil
             store.clear()
-            current.pendingIsRegistration = false
             current.pendingRegistration = Task {
                 await previous?.value
                 guard let client = client else {

@@ -424,6 +424,103 @@ final class ReachBellTests: XCTestCase {
         XCTAssertNil(jsonBody(transport.requests.last!)["previousToken"])
     }
 
+    func testResetCancelsInFlightPublicRegister() async throws {
+        let transport = MockTransport(replies: [
+            .json(status: 201, body: "{}"),
+            .delayed(seconds: 2, status: 201, body: "{}")
+        ])
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        let registering = Task { try await client.register() }
+        for _ in 0..<200 where transport.requests.count < 2 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(transport.requests.count, 2)
+
+        client.reset()
+        do {
+            try await registering.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+        }
+        await client.waitForPendingRegistration()
+        // reset() waited for the cancelled register(), then unidentified the token.
+        XCTAssertEqual(
+            transport.requests.map { $0.url?.path },
+            ["/subscribers", "/subscribers", "/subscribers/unidentify"]
+        )
+        XCTAssertNil(client.apnsToken)
+    }
+
+    func testRegisterQueuedAfterResetWaitsForUnidentify() async throws {
+        let transport = MockTransport(replies: [
+            .json(status: 201, body: "{}"),
+            .delayed(seconds: 0.2, status: 200, body: "{\"success\":true}")
+        ])
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        client.reset()
+        let started = Date()
+        do {
+            try await client.register()
+            XCTFail("expected noToken")
+        } catch ReachBellError.noToken {
+        }
+        // register() ran only after reset()'s unidentify call (0.2s) finished.
+        XCTAssertTrue(Date().timeIntervalSince(started) >= 0.15)
+        XCTAssertEqual(transport.requests.map { $0.url?.path }, ["/subscribers", "/subscribers/unidentify"])
+    }
+
+    func testIdentifyDuringPublicRegisterAfterResetLandsAfterTheNull() async throws {
+        let transport = MockTransport(replies: [
+            .json(status: 201, body: "{}"),
+            .json(status: 200, body: "{\"success\":true}"),
+            .failure(URLError(.notConnectedToInternet)), // keeps the clear pending
+            .delayed(seconds: 0.3, status: 201, body: "{}")
+        ])
+        let client = makeClient(transport)
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+        client.reset()
+        client.setAPNsToken(tokenData)
+        await client.waitForPendingRegistration()
+
+        let registered = Locked(false)
+        let registering = Task {
+            try await client.register()
+            registered.mutate { $0 = true }
+        }
+        for _ in 0..<200 where transport.requests.count < 4 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(jsonBody(transport.requests[3])["externalId"] is NSNull)
+
+        try await client.identify("u2")
+        // identify waited for the register() carrying externalId: null, so u2 is applied last.
+        XCTAssertTrue(registered.read { $0 })
+        try await registering.value
+        XCTAssertEqual(transport.requests.last?.url?.path, "/subscribers/identify")
+        XCTAssertEqual(jsonBody(transport.requests.last!)["externalId"] as? String, "u2")
+
+        // The pending clear is gone, so the next registration sends u2, never null.
+        try await client.register()
+        XCTAssertEqual(jsonBody(transport.requests.last!)["externalId"] as? String, "u2")
+    }
+
+    func testIdentifyDropsPendingClear() async throws {
+        let defaults = makeDefaults()
+        let client = makeClient(MockTransport(), defaults: defaults)
+        client.reset()
+        await client.waitForPendingRegistration()
+        XCTAssertTrue(defaults.bool(forKey: "com.reachbell.externalIdClearPending"))
+        try await client.identify("u2")
+        XCTAssertFalse(defaults.bool(forKey: "com.reachbell.externalIdClearPending"))
+    }
+
     func testURLSessionTransportCancelsDataTaskWhenTaskIsCancelled() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [HangingURLProtocol.self]
